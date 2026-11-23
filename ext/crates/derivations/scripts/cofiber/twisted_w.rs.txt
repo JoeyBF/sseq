@@ -1,0 +1,242 @@
+//! Solve the twisted cobar equation for the path weights W of an arbitrary finite module M:
+//! for cells c, b with delta = |c| - |b| >= 1 and Milnor basis triples (a1, a2, a3) (a1 the top
+//! step) with |a1| + |a2| + |a3| = delta + 1,
+//!
+//!   W_cb(a1 a2, a3) + W_cb(a1, a2 a3)
+//!     + sum_b' D_cb'(a3) W_b'b(a1, a2) + sum_b' W_cb'(a2, a3) D_b'b(a1)  =  O_cb(a1, a2, a3),
+//!
+//! where D_cb'(a) = <c, chi(a) b'> (sseq's delta_Q) and O_cb = <c, X(A(a1, sigma(a2) sigma(a3))) b>
+//! with X = chi (OBST=chi, default) or the identity (OBST=plain); A is the pair algebra's A-map.
+//! Prints a solution per block as a cocfit spec `c_deg>b_deg:d:P(..)|P(..)+...`, or reports the
+//! equations inconsistent.
+//!
+//! Usage: `twisted_w <module>`.
+
+use std::{collections::BTreeMap, sync::Arc};
+
+use algebra::{
+    Algebra, MilnorAlgebra,
+    module::{FDModule, Module},
+    pair_algebra::PairAlgebra,
+};
+use ext::{ext_algebra::tensor_resolution::Antipode, utils::load_module_json};
+use fp::vector::FpVector;
+
+type Cell = (i32, usize);
+
+fn main() -> anyhow::Result<()> {
+    let name = std::env::args().nth(1).unwrap();
+    let obst_chi = std::env::var("OBST").map_or(true, |v| v != "plain");
+    let no_twist = std::env::var("NO_TWIST").is_ok();
+    let algebra = Arc::new(MilnorAlgebra::new(fp::prime::TWO, false));
+    let m = FDModule::from_json(Arc::clone(&algebra), &load_module_json(&name)?)?;
+    let top = m.max_degree().unwrap();
+    let bot = m.min_degree();
+    algebra.compute_basis(top - bot + 4);
+    m.compute_basis(top + 2);
+    let chi = Antipode::new(Arc::clone(&algebra));
+    let cells: Vec<Cell> = (bot..=top).flat_map(|d| (0..m.dimension(d)).map(move |i| (d, i))).collect();
+    // <c, x b> for x a vector in degree |c| - |b|
+    let act = |x: &FpVector, b: Cell, c: Cell| -> u32 {
+        let d = c.0 - b.0;
+        let mut out = FpVector::new(fp::prime::TWO, m.dimension(c.0));
+        for (i, v) in x.iter_nonzero() {
+            m.act_on_basis(out.as_slice_mut(), v, d, i, b.0, b.1);
+        }
+        out.entry(c.1)
+    };
+    let basis_vec = |d: i32, i: usize| {
+        let mut v = FpVector::new(fp::prime::TWO, algebra.dimension(d));
+        v.set_entry(i, 1);
+        v
+    };
+    // D_{c -> b'}(a) = <c, chi(a) b'>
+    let dmap = |a: (i32, usize), b: Cell, c: Cell| -> u32 {
+        if c.0 - b.0 != a.0 {
+            return 0;
+        }
+        act(&chi.apply(a.0, a.1), b, c)
+    };
+    let s = |d: i32, i: usize| algebra.basis_element_to_string(d, i);
+    // unknowns
+    let blocks: Vec<(Cell, Cell)> = cells
+        .iter()
+        .flat_map(|&c| cells.iter().filter(move |&&b| c.0 > b.0).map(move |&b| (c, b)))
+        .collect();
+    let mut unk: BTreeMap<(Cell, Cell, i32, usize, i32, usize), usize> = BTreeMap::new();
+    let mut unk_list = vec![];
+    for &(c, b) in &blocks {
+        let delta = c.0 - b.0;
+        for d1 in 1..=delta {
+            let d2 = delta + 1 - d1;
+            for i1 in 0..algebra.dimension(d1) {
+                for i2 in 0..algebra.dimension(d2) {
+                    unk.insert((c, b, d1, i1, d2, i2), unk_list.len());
+                    unk_list.push((c, b, d1, i1, d2, i2));
+                }
+            }
+        }
+    }
+    let n = unk_list.len();
+    let words = n / 64 + 2;
+    let mut rows: Vec<Vec<u64>> = vec![];
+    let mut labels: Vec<String> = vec![];
+    let set = |row: &mut Vec<u64>, k: usize| row[k / 64] ^= 1 << (k % 64);
+    let mut n_obst = 0;
+    for &(c, b) in &blocks {
+        let delta = c.0 - b.0;
+        for d1 in 1..=delta {
+            for d2 in 1..=delta {
+                let d3 = delta + 1 - d1 - d2;
+                if d3 < 1 {
+                    continue;
+                }
+                for i1 in 0..algebra.dimension(d1) {
+                    for i2 in 0..algebra.dimension(d2) {
+                        let mut p12 = FpVector::new(fp::prime::TWO, algebra.dimension(d1 + d2));
+                        algebra.multiply_basis_elements(p12.as_slice_mut(), 1, d1, i1, d2, i2);
+                        for i3 in 0..algebra.dimension(d3) {
+                            let mut row = vec![0u64; words];
+                            for (e, v) in p12.iter_nonzero() {
+                                if v != 0 {
+                                    set(&mut row, unk[&(c, b, d1 + d2, e, d3, i3)]);
+                                }
+                            }
+                            let mut p23 = FpVector::new(fp::prime::TWO, algebra.dimension(d2 + d3));
+                            algebra.multiply_basis_elements(p23.as_slice_mut(), 1, d2, i2, d3, i3);
+                            for (e, v) in p23.iter_nonzero() {
+                                if v != 0 {
+                                    set(&mut row, unk[&(c, b, d1, i1, d2 + d3, e)]);
+                                }
+                            }
+                            if !no_twist {
+                                for &bp in &cells {
+                                    // D_{c -> b'}(a3) W_{b' -> b}(a1, a2)
+                                    if bp.0 > b.0 && c.0 - bp.0 == d3 && dmap((d3, i3), bp, c) != 0 {
+                                        set(&mut row, unk[&(bp, b, d1, i1, d2, i2)]);
+                                    }
+                                    // W_{c -> b'}(a2, a3) D_{b' -> b}(a1)
+                                    if bp.0 < c.0 && bp.0 - b.0 == d1 && dmap((d1, i1), b, bp) != 0 {
+                                        set(&mut row, unk[&(c, bp, d2, i2, d3, i3)]);
+                                    }
+                                }
+                            }
+                            // the obstruction
+                            let mut e = algebra.new_pair_element(d2 + d3);
+                            algebra.sigma_multiply_basis(&mut e, 1, d2, i2, d3, i3);
+                            let mut tw = algebra.new_pair_element(d2 + d3);
+                            tw.twos_mut().add(e.twos(), 1);
+                            for (k, r) in e.ys().iter().enumerate() {
+                                for (l, v) in r.iter().enumerate() {
+                                    tw.ys_mut()[k][l].add(v, 1);
+                                }
+                            }
+                            <MilnorAlgebra as PairAlgebra>::finalize_element(&mut tw);
+                            let mut out = FpVector::new(fp::prime::TWO, algebra.dimension(delta));
+                            algebra.a_multiply(
+                                out.as_slice_mut(),
+                                1,
+                                d1,
+                                basis_vec(d1, i1).as_slice(),
+                                d2 + d3,
+                                &tw,
+                            );
+                            let x = if obst_chi {
+                                let mut x = FpVector::new(fp::prime::TWO, algebra.dimension(delta));
+                                for (i, v) in out.iter_nonzero() {
+                                    x.add(&chi.apply(delta, i), v);
+                                }
+                                x
+                            } else {
+                                out
+                            };
+                            let o = act(&x, b, c);
+                            n_obst += o as usize;
+                            if o != 0 {
+                                row[n / 64 + 1] |= 1 << 63; // rhs flag
+                            }
+                            labels.push(format!("{c:?}->{b:?} {}|{}|{} obst={o}", s(d1, i1), s(d2, i2), s(d3, i3)));
+                            rows.push(row);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Gaussian elimination, rhs in the last bit
+    let rhs = |r: &Vec<u64>| r[n / 64 + 1] >> 63 & 1;
+    let top_bit = |r: &Vec<u64>| -> Option<usize> {
+        (0..n).rev().find(|&k| r[k / 64] >> (k % 64) & 1 != 0)
+    };
+    let mut piv: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
+    let mut inconsistent = 0;
+    let nr = rows.len();
+    let mut combs: BTreeMap<usize, Vec<bool>> = BTreeMap::new();
+    for (ri, mut r) in rows.into_iter().enumerate() {
+        let mut comb = vec![false; nr];
+        comb[ri] = true;
+        loop {
+            match top_bit(&r) {
+                None => {
+                    if rhs(&r) != 0 {
+                        inconsistent += 1;
+                        eprintln!("contradiction from:");
+                        for (k, &t) in comb.iter().enumerate() {
+                            if t {
+                                eprintln!("  {}", labels[k]);
+                            }
+                        }
+                    }
+                    break;
+                }
+                Some(p) => match piv.get(&p) {
+                    Some(pr) => {
+                        for w in 0..words {
+                            r[w] ^= pr[w];
+                        }
+                        let pc = &combs[&p];
+                        for k in 0..nr {
+                            comb[k] ^= pc[k];
+                        }
+                    }
+                    None => {
+                        piv.insert(p, r);
+                        combs.insert(p, comb);
+                        break;
+                    }
+                },
+            }
+        }
+    }
+    eprintln!(
+        "{name}: {n} unknowns, rank {}, obstruction entries {n_obst}, {}",
+        piv.len(),
+        if inconsistent == 0 { "CONSISTENT".to_string() } else { format!("INCONSISTENT ({inconsistent})") }
+    );
+    // back substitution, free variables 0
+    let mut sol = vec![0u64; words];
+    for (&p, r) in &piv {
+        let mut v = rhs(r);
+        for k in 0..p {
+            if r[k / 64] >> (k % 64) & 1 != 0 && sol[k / 64] >> (k % 64) & 1 != 0 {
+                v ^= 1;
+            }
+        }
+        if v != 0 {
+            sol[p / 64] |= 1 << (p % 64);
+        }
+    }
+    let mut spec: BTreeMap<(i32, i32), Vec<String>> = BTreeMap::new();
+    for &(c, b) in &blocks {
+        spec.entry((c.0, b.0)).or_default();
+    }
+    for (k, &(c, b, d1, i1, d2, i2)) in unk_list.iter().enumerate() {
+        if sol[k / 64] >> (k % 64) & 1 != 0 {
+            spec.get_mut(&(c.0, b.0)).unwrap().push(format!("d:{}|{}", s(d1, i1), s(d2, i2)));
+        }
+    }
+    for ((cd, bd), v) in spec {
+        println!("{cd}>{bd}:{}", if v.is_empty() { "0".to_string() } else { v.join("+") });
+    }
+    Ok(())
+}
