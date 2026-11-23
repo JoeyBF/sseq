@@ -1,0 +1,263 @@
+//! The universal cross term: sseq's secondary algorithm on the bar resolution `B` of `F_2` and on
+//! `B ⊗ M`; prints `U − χ-shear(H_B)` on the generators `[a1|a2|a3] ⊗ b → [a] ⊗ c`.
+//!
+//! Usage: `bar_w <module> [t_max] [s_max]`.
+
+use std::{collections::HashMap, sync::Arc};
+
+use algebra::{
+    Algebra, MilnorAlgebra,
+    module::{
+        FDModule, FreeModule, Module,
+        homomorphism::{FreeModuleHomomorphism, ModuleHomomorphism},
+    },
+};
+use ext::{
+    chain_complex::ChainComplex,
+    ext_algebra::tensor_resolution::{Antipode, TensorResolutionSecondary},
+    secondary::SecondaryLift,
+    utils::load_module_json,
+};
+use fp::vector::FpVector;
+use sseq::coordinates::{Bidegree, BidegreeGenerator};
+
+type Word = Vec<(i32, usize)>;
+
+/// The reduced bar resolution of `F_2`, through internal degree `t_max` and `s ≤ s_max`.
+struct Bar {
+    algebra: Arc<MilnorAlgebra>,
+    modules: Vec<Arc<FreeModule<MilnorAlgebra>>>,
+    diffs: Vec<Arc<FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>>>,
+    zero: Arc<FreeModule<MilnorAlgebra>>,
+    /// words[s][t]: the generators of B_s in degree t
+    words: Vec<Vec<Vec<Word>>>,
+    index: Vec<HashMap<Word, usize>>,
+    t_max: i32,
+    s_max: i32,
+}
+
+impl Bar {
+    /// Builds `B` through `(s_max, t_max)` with its differentials' quasi-inverses.
+    fn new(algebra: Arc<MilnorAlgebra>, t_max: i32, s_max: i32) -> Self {
+        algebra.compute_basis(t_max + 1);
+        let mut words: Vec<Vec<Vec<Word>>> = vec![];
+        for s in 0..=s_max {
+            let mut by_t: Vec<Vec<Word>> = vec![vec![]; (t_max + 1) as usize];
+            if s == 0 {
+                by_t[0].push(vec![]);
+            } else {
+                for t in 1..=t_max {
+                    for w in &words[(s - 1) as usize] {
+                        let _ = w;
+                    }
+                    let _ = t;
+                }
+                // extend words of s-1 by one more letter at the end
+                for t0 in 0..=t_max {
+                    for w in &words[(s - 1) as usize][t0 as usize] {
+                        for d in 1..=t_max - t0 {
+                            for i in 0..algebra.dimension(d) {
+                                let mut w2 = w.clone();
+                                w2.push((d, i));
+                                by_t[(t0 + d) as usize].push(w2);
+                            }
+                        }
+                    }
+                }
+            }
+            words.push(by_t);
+        }
+        let index: Vec<HashMap<Word, usize>> = words
+            .iter()
+            .map(|by_t| {
+                let mut h = HashMap::new();
+                for ws in by_t {
+                    for (i, w) in ws.iter().enumerate() {
+                        h.insert(w.clone(), i);
+                    }
+                }
+                h
+            })
+            .collect();
+        let zero = Arc::new(FreeModule::new(Arc::clone(&algebra), "0".to_string(), 0));
+        zero.compute_basis(t_max);
+        let modules: Vec<Arc<FreeModule<MilnorAlgebra>>> = (0..=s_max)
+            .map(|s| {
+                let m = Arc::new(FreeModule::new(Arc::clone(&algebra), format!("B_{s}"), 0));
+                m.compute_basis(t_max);
+                for t in 0..=t_max {
+                    m.add_generators(t, words[s as usize][t as usize].len(), None);
+                }
+                m
+            })
+            .collect();
+        let mut diffs = vec![];
+        for s in 0..=s_max {
+            let target = if s == 0 { Arc::clone(&zero) } else { Arc::clone(&modules[(s - 1) as usize]) };
+            let d = FreeModuleHomomorphism::new(Arc::clone(&modules[s as usize]), target, 0);
+            if s == 0 {
+                d.extend_by_zero(t_max);
+            } else {
+                let tgt = &modules[(s - 1) as usize];
+                for t in 0..=t_max {
+                    let mut rows = vec![];
+                    for w in &words[s as usize][t as usize] {
+                        let mut out = FpVector::new(fp::prime::TWO, tgt.dimension(t));
+                        // a1 · [a2 | ... ]
+                        let (a1d, a1i) = w[0];
+                        let rest: Word = w[1..].to_vec();
+                        let gi = index[(s - 1) as usize][&rest];
+                        out.add_basis_element(tgt.generator_offset(t, t - a1d, gi) + a1i, 1);
+                        // [ ... | a_i a_{i+1} | ... ]
+                        for i in 0..w.len() - 1 {
+                            let (d1, i1) = w[i];
+                            let (d2, i2) = w[i + 1];
+                            let mut prod = FpVector::new(fp::prime::TWO, algebra.dimension(d1 + d2));
+                            algebra.multiply_basis_elements(prod.as_slice_mut(), 1, d1, i1, d2, i2);
+                            for (e, _) in prod.iter_nonzero() {
+                                let mut w2: Word = w[..i].to_vec();
+                                w2.push((d1 + d2, e));
+                                w2.extend_from_slice(&w[i + 2..]);
+                                let gi = index[(s - 1) as usize][&w2];
+                                out.add_basis_element(tgt.generator_offset(t, t, gi), 1);
+                            }
+                        }
+                        rows.push(out);
+                    }
+                    d.add_generators_from_rows(t, rows);
+                }
+            }
+            d.compute_auxiliary_data_through_degree(t_max);
+            diffs.push(Arc::new(d));
+        }
+        Self { algebra, modules, diffs, zero, words, index, t_max, s_max }
+    }
+}
+
+impl ChainComplex for Bar {
+    type Algebra = MilnorAlgebra;
+    type Homomorphism = FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>;
+    type Module = FreeModule<MilnorAlgebra>;
+
+    fn algebra(&self) -> Arc<MilnorAlgebra> {
+        Arc::clone(&self.algebra)
+    }
+
+    fn min_degree(&self) -> i32 {
+        0
+    }
+
+    fn zero_module(&self) -> Arc<Self::Module> {
+        Arc::clone(&self.zero)
+    }
+
+    fn module(&self, s: i32) -> Arc<Self::Module> {
+        Arc::clone(&self.modules[s as usize])
+    }
+
+    fn differential(&self, s: i32) -> Arc<Self::Homomorphism> {
+        Arc::clone(&self.diffs[s as usize])
+    }
+
+    fn has_computed_bidegree(&self, b: Bidegree) -> bool {
+        b.s() >= 0 && b.s() <= self.s_max && b.t() <= self.t_max
+    }
+
+    fn compute_through_bidegree(&self, _b: Bidegree) {}
+
+    fn next_homological_degree(&self) -> i32 {
+        self.s_max + 1
+    }
+}
+
+/// Injects `F` (from `exact_w`'s `F_OUT`) as `H_2` on `B ⊗ M` and tries the steps s = 3..=5.
+/// Run with `SEC_USE_H2=1`. Usage: `bar_s4 <module> <t_max> <F file>`.
+fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let name = &args[1];
+    let t_max: i32 = args[2].parse()?;
+    let fpath = &args[3];
+    let algebra = Arc::new(MilnorAlgebra::new(fp::prime::TWO, false));
+    let bar = Arc::new(Bar::new(Arc::clone(&algebra), t_max, 6));
+    let m = FDModule::from_json(Arc::clone(&algebra), &load_module_json(name)?)?;
+    m.compute_basis(t_max + 2);
+    let module = Arc::new(m);
+    let _ = Antipode::new(Arc::clone(&algebra));
+    let mut by_name: HashMap<String, (i32, usize)> = HashMap::new();
+    for d in 0..=t_max {
+        for i in 0..algebra.dimension(d) {
+            by_name.insert(algebra.basis_element_to_string(d, i), (d, i));
+        }
+    }
+    // F: (word [x|y], b) -> [(m, e)]
+    let mut fmap: HashMap<(Word, (i32, usize)), Vec<((i32, usize), (i32, usize))>> = HashMap::new();
+    for line in std::fs::read_to_string(fpath)?.lines() {
+        let f: Vec<&str> = line.split(';').collect();
+        let (x, y) = f[0].split_once('|').unwrap();
+        let w: Word = vec![by_name[x], by_name[y]];
+        let p = |i: usize| f[i].parse::<i32>().unwrap();
+        fmap.entry((w, (p(1), p(2) as usize)))
+            .or_default()
+            .push(((p(3), p(4) as usize), (p(5), p(6) as usize)));
+    }
+
+    let trs = TensorResolutionSecondary::new(Arc::clone(&bar), Arc::clone(&module));
+    let q = trs.resolution();
+    q.compute_through_bidegree(Bidegree::s_t(5, t_max));
+    let qsec = trs.secondary();
+    qsec.initialize_homotopies();
+    qsec.compute_composites();
+    // H_2 := F
+    let h2 = &qsec.homotopies()[2];
+    let q0 = q.module(0);
+    let top = module.max_degree().unwrap_or(0);
+    for t in h2.homotopies.next_degree()..=h2.composites.max_degree() {
+        // Q_2's generators in degree t: (word, cell)
+        let n = q.module(2).number_of_gens_in_degree(t);
+        let mut rows = vec![FpVector::new(fp::prime::TWO, q0.dimension(t - 1)); n];
+        for dw in 2..=t {
+            for (wi, w) in bar.words[2][dw as usize].iter().enumerate() {
+                let bd = t - dw;
+                if bd < module.min_degree() || bd > top {
+                    continue;
+                }
+                for bi in 0..module.dimension(bd) {
+                    let Some(gi) = q.q_gen_index(2, t, dw, wi, bi) else { continue };
+                    let Some(entries) = fmap.get(&(w.clone(), (bd, bi))) else { continue };
+                    for &(mm, e) in entries {
+                        if e.0 != t - 1 - mm.0 {
+                            continue;
+                        }
+                        let Some(tg) = q.q_gen_index(0, mm.0, 0, 0, mm.1) else { continue };
+                        rows[gi].add_basis_element(q0.generator_offset(t - 1, mm.0, tg) + e.1, 1);
+                    }
+                }
+            }
+        }
+        h2.homotopies.add_generators_from_rows(t, rows);
+    }
+    let mut fails: Vec<(i32, i32)> = vec![];
+    for t in 0..=t_max {
+        for s in 3..=5 {
+            let b = Bidegree::s_t(s, t);
+            if !q.has_computed_bidegree(b) || qsec.homotopies()[s].composites.max_degree() < t {
+                continue;
+            }
+            if qsec.homotopies()[s].homotopies.next_degree() > t {
+                continue;
+            }
+            if let Err(e) = qsec.try_compute_homotopy_step(b) {
+                fails.push((s, t));
+                eprintln!("{e}");
+                // keep going: fill this bidegree with zero so later steps run
+                let h = &qsec.homotopies()[s].homotopies;
+                if h.next_degree() == t {
+                    h.extend_by_zero(t);
+                }
+            }
+        }
+    }
+    println!("{name}: lift failures (s, t): {fails:?}");
+    Ok(())
+}
+

@@ -122,3 +122,13 @@ lies in its solution space for all eleven modules (fitting homogeneous direction
 normalization tried (`nopath`; `minimal`: F vanishes on the minimal resolution's 2-paths) picks the
 truth's solution for the Joker, its dual, C2 ∧ Cν and C2 ∧ Cσ. Since Ext^{2,1}(J, J) = 0 the s = 3
 condition cannot be all: liftability at s = 4 (through H_3) must constrain H_2 further. Open.
+
+Injecting a solution `F` as `H_2` on `B ⊗ M` (`bar_s4`, with sseq's recursion allowed to read a
+nonzero `H_2`, `SEC_USE_H2`) and continuing sseq's algorithm: for the Joker both the plain solution
+and the one the ground truth needs lift through s = 5 (t ≤ 8). So the remaining freedom is not
+decided on the bar side: both are valid secondary resolutions of `B ⊗ M`. What decides it is how the
+formula `U = χ-shear(H_P) + W∘f` (f: P → B the comparison map, which sends g to its d∘d paths) is
+tied to the sphere's own choice of `H_P`: a chain map between secondary resolutions carries a
+correction homotopy `G` (`f H_P` versus `H_B f`), whose unit part adds path terms to `W`. For the
+two-cell and split modules that contribution is invisible; for the Joker, C2 ∧ Cν and C2 ∧ Cσ it is
+not. The derivation is complete once `G` is computed (a recursion of the same kind as `H`).

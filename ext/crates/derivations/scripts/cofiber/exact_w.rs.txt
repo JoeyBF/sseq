@@ -306,7 +306,39 @@ fn main() -> anyhow::Result<()> {
         }
         by
     };
-    let sol = solve(None);
+    let mut sol = solve(None);
+    // ADD_FREE=k,k,...: add the homogeneous solutions of these free variables
+    if let Ok(v) = std::env::var("ADD_FREE") {
+        for k in v.split(',').filter(|x| !x.is_empty()) {
+            let h = solve(Some(k.parse()?));
+            for w in 0..words {
+                sol[w] ^= h[w];
+            }
+        }
+    }
+    // F_OUT=<file>: the whole of F, `x|y,b_deg,b_idx,m_deg,m_idx,e`
+    if let Ok(path) = std::env::var("F_OUT") {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        for (k, &(x, y, b, mm, e)) in list.iter().enumerate() {
+            if sol[k / 64] >> (k % 64) & 1 != 0 {
+                writeln!(
+                    f,
+                    "{}|{};{};{};{};{};{};{};{};{}",
+                    s(x.0, x.1),
+                    s(y.0, y.1),
+                    b.0,
+                    b.1,
+                    mm.0,
+                    mm.1,
+                    e.0,
+                    e.1,
+                    x.0 + y.0,
+                    0
+                )?;
+            }
+        }
+    }
     let by = blocks_of(&sol);
     // degree-keyed spec on stdout (for cocfit), full spec to SPEC_OUT (for module_d2)
     let mut by_deg: BTreeMap<(i32, i32), Vec<String>> = BTreeMap::new();
