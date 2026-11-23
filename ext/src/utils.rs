@@ -14,6 +14,7 @@ use crate::{
     chain_complex::{AugmentedChainComplex, BoundedChainComplex, ChainComplex, FiniteChainComplex},
     resolution::{Resolution, UnstableResolution},
     save::SaveDirectory,
+    secondary::SecondaryActions,
 };
 
 // We build docs with --all-features so the docs are at the feature = "nassau" version
@@ -207,7 +208,10 @@ where
     if !json["cofiber"].is_null() {
         return Err(anyhow!("Nassau's algorithm does not support cofiber"));
     }
-    crate::nassau::Resolution::new_with_save(module, save_dir)
+    let actions = SecondaryActions::from_json(&*algebra, &*module, &json)?;
+    let mut resolution = crate::nassau::Resolution::new_with_save(module, save_dir)?;
+    resolution.set_secondary_actions(actions);
+    Ok(resolution)
 }
 
 /// See [`construct`]
@@ -228,9 +232,13 @@ where
     let algebra = Arc::new(SteenrodAlgebra::from_json(&json, algebra, U)?);
     let module = Arc::new(steenrod_module::from_json(Arc::clone(&algebra), &json)?);
     let mut chain_complex = Arc::new(FiniteChainComplex::ccdz(Arc::clone(&module)));
+    let actions = SecondaryActions::from_json(&*algebra, &*module, &json)?;
 
     let cofiber = &json["cofiber"];
     if !cofiber.is_null() {
+        if actions.is_some() {
+            return Err(anyhow!("Secondary actions are not supported with cofiber"));
+        }
         if U {
             return Err(anyhow!("Cofiber not supported for unstable resolution"));
         }
@@ -294,7 +302,9 @@ where
         chain_complex = Arc::new(yoneda.map(|m| steenrod_module::erase(m.clone())));
     }
 
-    crate::resolution::MuResolution::new_with_save(chain_complex, save_dir)
+    let mut resolution = crate::resolution::MuResolution::new_with_save(chain_complex, save_dir)?;
+    resolution.set_secondary_actions(actions);
+    Ok(resolution)
 }
 
 /// Load a module specification from a JSON file.
