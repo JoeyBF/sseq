@@ -13,7 +13,8 @@ feat_p, easy_p, cone_p, sd2_p, j, max_n = sys.argv[1:7]
 j, max_n = int(j), int(max_n)
 shift = 1 << j
 FORMULA = {0: ["H:P(1)"], 1: ["H:P(2)"], 2: ["H:P(4)", "d:P(2)|P(0, 1)", "d:P(2)|P(3)", "d:P(3)|P(2)"],
-           3: ["H:P(8)"]}
+           3: ["H:P(8)", "d:P(4)|P(5)", "d:P(5)|P(4)", "d:P(0, 2)|P(0, 1)", "d:P(6)|P(0, 1)",
+               "d:P(2, 2)|P(1)", "d:P(2)|P(0, 0, 1)"]}
 
 
 def vec(s):

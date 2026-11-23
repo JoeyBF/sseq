@@ -35,7 +35,8 @@ fn main() -> anyhow::Result<()> {
     let max_n: i32 = std::env::var("FEAT_MAX_N").map_or(58, |v| v.parse().unwrap());
     let max_s: i32 = std::env::var("FEAT_MAX_S").map_or(28, |v| v.parse().unwrap());
     println!("j,stem,Adams_filtration,index,feature,value");
-    for j in 0..=3 {
+    let max_j: i32 = std::env::var("FEAT_MAX_J").map_or(3, |v| v.parse().unwrap());
+    for j in 0..=max_j {
         let jump = (1 << j) + 1;
         for s in 0..=max_s {
             for n in 0..=max_n {
@@ -92,6 +93,44 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
+                    // the sphere's secondary composite at g: its 2e and Y_kl b terms at each x
+                    let want_c = std::env::var("FEAT_ONLY").map_or(true, |o| o.contains("C:"));
+                    let hom2 = res_lift.homotopy(s + 2);
+                    if want_c && hom2.composites.max_degree() >= tg {
+                        let comp = hom2.composite(tg, g);
+                        for x in 0..dim {
+                            let Some(e) = comp.coefficient(tz, x) else {
+                                continue;
+                            };
+                            let cd = tg - tz;
+                            for (i, c) in e.twos().iter().enumerate() {
+                                if c != 0 {
+                                    add(
+                                        format!("C:2{}", algebra.basis_element_to_string(cd, i)),
+                                        x,
+                                        g,
+                                    );
+                                }
+                            }
+                            for (k, row) in e.ys().iter().enumerate() {
+                                for (l, v) in row.iter().enumerate() {
+                                    let bd = cd + 1 - (1 << k) - (1 << l);
+                                    for (i, c) in v.iter().enumerate() {
+                                        if c != 0 {
+                                            add(
+                                                format!(
+                                                    "C:Y{k}{l}.{}",
+                                                    algebra.basis_element_to_string(bd, i)
+                                                ),
+                                                x,
+                                                g,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // the secondary homotopy's coefficients of degree 2^j
                     let hom = &res_lift.homotopy(s + 2).homotopies;
                     if hom.next_degree() > tg {
@@ -113,7 +152,37 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+                // E:h: the product h_j e_x at (n + 2^j - 1, s + 1), the Sq^{2^j} coefficient of d
+                {
+                    let hb = Bidegree::n_s(n + (1 << j) - 1, s + 1);
+                    if res.has_computed_bidegree(hb) {
+                        let hdim = res.number_of_gens_in_bidegree(hb);
+                        let th = tz + (1 << j);
+                        let c = 1 << j;
+                        let p_s = res.module(s);
+                        let d1 = res.differential(s + 1);
+                        let sq = (0..algebra.dimension(c))
+                            .find(|&e| algebra.basis_element_to_string(c, e) == format!("P({c})"))
+                            .unwrap();
+                        let offx = p_s.generator_offset(th, tz, 0);
+                        for x in 0..dim {
+                            let row: Vec<u32> = (0..hdim)
+                                .map(|g| d1.output(th, g).entry(offx + x * algebra.dimension(c) + sq))
+                                .collect();
+                            if row.iter().any(|&v| v != 0) {
+                                println!("{j},{n},{s},{x},E:h,\"{row:?}\"");
+                            }
+                        }
+                    }
+                }
+                // FEAT_ONLY=name;name;...: write only these operators
+                let only: Option<Vec<String>> = std::env::var("FEAT_ONLY")
+                    .ok()
+                    .map(|v| v.split(';').map(str::to_string).collect());
                 for (name, m) in &feats {
+                    if only.as_ref().is_some_and(|o| !o.iter().any(|x| x == name)) {
+                        continue;
+                    }
                     for (x, row) in m.iter().enumerate() {
                         if row.iter().any(|&v| v != 0) {
                             println!("{j},{n},{s},{x},{name},\"{row:?}\"");

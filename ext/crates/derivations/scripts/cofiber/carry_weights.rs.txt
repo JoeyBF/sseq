@@ -1,0 +1,142 @@
+//! The weights of the Z/4 carry on two-step paths: for Milnor basis elements a, b with
+//! |a| + |b| = 2^j + 1, whether sum over coproduct terms of [Sq^1 in a'b'] [tau(a'', b'') carries
+//! m0 to the top cell of C(h_j)] is 1, with tau the 2-part of sigma(a'')sigma(b'') (and of
+//! sigma(b'')sigma(a'')), acting through the antipode.
+//!
+//! Usage: `carry_weights <module> <j>`.
+
+use std::sync::Arc;
+
+use algebra::{
+    Algebra, MilnorAlgebra,
+    module::{FDModule, Module},
+    pair_algebra::PairAlgebra,
+};
+use ext::{
+    ext_algebra::tensor_resolution::{Antipode, FullCoproduct},
+    utils::load_module_json,
+};
+use fp::vector::FpVector;
+
+fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let name = &args[1];
+    let j: i32 = args[2].parse()?;
+    let top = 1 << j;
+    let algebra = Arc::new(MilnorAlgebra::new(fp::prime::TWO, false));
+    algebra.compute_basis(top + 4);
+    let m = FDModule::from_json(Arc::clone(&algebra), &load_module_json(name)?)?;
+    m.compute_basis(top + 2);
+    let cop = FullCoproduct::new(Arc::clone(&algebra));
+    let chi = Antipode::new(Arc::clone(&algebra));
+    let carries = |deg: i32, e: &algebra::pair_algebra::MilnorPairElement| -> bool {
+        let mut hit = false;
+        for (ti, c) in e.twos().iter().enumerate() {
+            if c == 0 {
+                continue;
+            }
+            let ch = chi.apply(deg, ti);
+            let mut v = FpVector::new(algebra.prime(), m.dimension(top));
+            for (o, oc) in ch.iter_nonzero() {
+                m.act_on_basis(v.as_slice_mut(), oc, deg, o, 0, 0);
+            }
+            hit ^= v.entry(0) != 0;
+        }
+        hit
+    };
+    let sq1 = 0;
+    for ad in 1..=top {
+        let bd = top + 1 - ad;
+        for ai in 0..algebra.dimension(ad) {
+            for bi in 0..algebra.dimension(bd) {
+                let mut w = [false; 2];
+                for &(al, ali, ar, ari) in cop.terms(ad, ai).iter() {
+                    for &(bl, bli, br, bri) in cop.terms(bd, bi).iter() {
+                        if ar + br != top || al + bl != 1 {
+                            continue;
+                        }
+                        let mut left = FpVector::new(algebra.prime(), algebra.dimension(1));
+                        algebra.multiply_basis_elements(left.as_slice_mut(), 1, al, ali, bl, bli);
+                        if left.entry(sq1) == 0 {
+                            continue;
+                        }
+                        for (v, (f, s)) in [((ar, ari), (br, bri)), ((br, bri), (ar, ari))]
+                            .into_iter()
+                            .enumerate()
+                        {
+                            let mut e = algebra.new_pair_element(top);
+                            algebra.sigma_multiply_basis(&mut e, 1, f.0, f.1, s.0, s.1);
+                            if carries(top, &e) {
+                                w[v] ^= true;
+                            }
+                        }
+                    }
+                }
+                // the Y-term rule: in sigma(a)sigma(b), each Y_{k,l} c with Q_l = Sq^1 (or Q_k,
+                // for the other index order) and Q_k c (resp. Q_l c) carrying m0 to the top cell
+                let mut e = algebra.new_pair_element(top + 1);
+                algebra.sigma_multiply_basis(&mut e, 1, ad, ai, bd, bi);
+                let mut y = [false; 2];
+                for (k, row) in e.ys().iter().enumerate() {
+                    for (l, v) in row.iter().enumerate() {
+                        let cd = top + 1 + 1 - (1 << k) - (1 << l);
+                        for (ci, c) in v.iter().enumerate() {
+                            if c == 0 {
+                                continue;
+                            }
+                            for (o, (lo, hi)) in [(l, k), (k, l)].into_iter().enumerate() {
+                                if lo != 0 {
+                                    continue;
+                                }
+                                // Q_hi * c, degree 2^{hi+1} - 1 + cd
+                                let qd = (1 << (hi + 1)) - 1;
+                                if qd + cd != top {
+                                    continue;
+                                }
+                                let qi = (0..algebra.dimension(qd))
+                                    .find(|&i| {
+                                        let s = algebra.basis_element_to_string(qd, i);
+                                        s == format!("P({})", ["1", "0, 1", "0, 0, 1", "0, 0, 0, 1"][hi])
+                                    })
+                                    .unwrap();
+                                let mut prod = FpVector::new(algebra.prime(), algebra.dimension(top));
+                                algebra.multiply_basis_elements(prod.as_slice_mut(), 1, qd, qi, cd, ci);
+                                let mut hit = false;
+                                for (pi, pc) in prod.iter_nonzero() {
+                                    let ch = chi.apply(top, pi);
+                                    let mut vv = FpVector::new(algebra.prime(), m.dimension(top));
+                                    for (oo, oc) in ch.iter_nonzero() {
+                                        m.act_on_basis(vv.as_slice_mut(), oc * pc, top, oo, 0, 0);
+                                    }
+                                    hit ^= vv.entry(0) != 0;
+                                }
+                                if hit {
+                                    y[o] ^= true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if y[0] || y[1] {
+                    println!(
+                        "({}, {}): Y-rule {} {}",
+                        algebra.basis_element_to_string(ad, ai),
+                        algebra.basis_element_to_string(bd, bi),
+                        y[0] as u8,
+                        y[1] as u8
+                    );
+                }
+                if w[0] || w[1] {
+                    println!(
+                        "({}, {}): carry {} rev {}",
+                        algebra.basis_element_to_string(ad, ai),
+                        algebra.basis_element_to_string(bd, bi),
+                        w[0] as u8,
+                        w[1] as u8
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
