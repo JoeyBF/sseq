@@ -47,6 +47,11 @@ fn main() -> anyhow::Result<()> {
         m.compute_basis(t_max);
         let module = Arc::new(m);
         let trs = TensorResolutionSecondary::new(Arc::clone(&res), Arc::clone(&module));
+        // by stem: keep the generators of P (x) M whose P-generator has stem <= pmax
+        let pmax = max_n + top_deg + 2;
+        if std::env::var("TRUTH_BY_T").is_err() {
+            trs.resolution().set_pstem_max(pmax);
+        }
         trs.compute_through_stem(Bidegree::n_s(max_n + top_deg, max_s));
         eprintln!("{name}: secondary resolution of P (x) M computed");
         let q = trs.resolution();
@@ -55,6 +60,9 @@ fn main() -> anyhow::Result<()> {
         let index = |s: i32, t: i32, g: (i32, usize), alpha: usize| -> Option<usize> {
             let mut idx = 0;
             for (d, i) in res.module(s).iter_gens(t) {
+                if std::env::var("TRUTH_BY_T").is_err() && d - s > pmax {
+                    continue;
+                }
                 let dm = module.dimension(t - d);
                 if (d, i) == g {
                     return (alpha < dm).then_some(idx + alpha);

@@ -17,7 +17,7 @@ use std::{collections::BTreeSet, sync::Arc};
 use algebra::{
     Algebra, MilnorAlgebra,
     module::{FDModule, Module},
-    pair_algebra::MilnorPairElement,
+    pair_algebra::{MilnorPairElement, PairAlgebra},
 };
 use ext::{
     chain_complex::ChainComplex,
@@ -107,6 +107,151 @@ fn main() -> anyhow::Result<()> {
         }
         v.iter_nonzero().map(|(i, _)| i).collect()
     };
+
+    // Prediction of the composite defect by Z/4 carries, in four variants: for each d o d path
+    // g -> y -> x with coefficients a, b and each pair of coproduct terms, the 2-part tau of the
+    // product of the right factors (order a''b'' or b''a'', acting through chi or not) moves to
+    // the left as 2 a'b'.
+    let act_plain = |op_deg: i32, op_idx: usize, md: i32, mi: usize| -> Vec<usize> {
+        let mut v = fp::vector::FpVector::new(algebra.prime(), module.dimension(md + op_deg));
+        module.act_on_basis(v.as_slice_mut(), 1, op_deg, op_idx, md, mi);
+        v.iter_nonzero().map(|(i, _)| i).collect()
+    };
+    let carry = |a: (i32, usize), b: (i32, usize), md: i32, mi: usize, m2d: i32, m2i: usize|
+     -> [BTreeSet<Term>; 4] {
+        let mut out: [BTreeSet<Term>; 4] = Default::default();
+        for &(al, ali, ar, ari) in cop.terms(a.0, a.1).iter() {
+            for &(bl, bli, br, bri) in cop.terms(b.0, b.1).iter() {
+                if md + ar + br != m2d || ar + br == 0 {
+                    continue;
+                }
+                // the left factor a' b' (mod 2)
+                let mut left = fp::vector::FpVector::new(algebra.prime(), algebra.dimension(al + bl));
+                algebra.multiply_basis_elements(left.as_slice_mut(), 1, al, ali, bl, bli);
+                let lefts: Vec<usize> = left.iter_nonzero().map(|(i, _)| i).collect();
+                if lefts.is_empty() {
+                    continue;
+                }
+                for (v, (first, second)) in [((ar, ari), (br, bri)), ((br, bri), (ar, ari))]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let mut e = algebra.new_pair_element(ar + br);
+                    algebra.sigma_multiply_basis(&mut e, 1, first.0, first.1, second.0, second.1);
+                    let mut hit = [false; 2];
+                    for (ti, c) in e.twos().iter().enumerate() {
+                        if c == 0 {
+                            continue;
+                        }
+                        if act(ar + br, ti, md, mi).contains(&m2i) {
+                            hit[0] ^= true;
+                        }
+                        if act_plain(ar + br, ti, md, mi).contains(&m2i) {
+                            hit[1] ^= true;
+                        }
+                    }
+                    for w in 0..2 {
+                        if hit[w] {
+                            for &c in &lefts {
+                                let key = ((9, 9), al + bl, c);
+                                let set = &mut out[2 * w + v];
+                                if !set.remove(&key) {
+                                    set.insert(key);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    };
+    let mut explained = [0usize; 4];
+    let mut defects = 0usize;
+    for s in 2..=max_s {
+        let hom = qsec.homotopy(s);
+        let d_s = res.differential(s);
+        let d_s1 = res.differential(s - 1);
+        let p1 = res.module(s - 1);
+        let p2 = res.module(s - 2);
+        for n in 0..=max_n + top {
+            let t = n + s;
+            if hom.composites.max_degree() < t {
+                continue;
+            }
+            for (qi, &(d, i, md, mi)) in qgens(s, t).iter().enumerate() {
+                let comp = hom.composite(t, qi);
+                let pc = sres.homotopy(s).composite(d, i);
+                let dg = d_s.output(d, i);
+                for tt in 0..t {
+                    for (ti, &(hd, hi, hmd, hmi)) in qgens(s - 2, tt).iter().enumerate() {
+                        let actual = comp
+                            .coefficient(tt, ti)
+                            .map_or_else(BTreeSet::new, |e| terms(t - tt, e));
+                        let mut naive: BTreeSet<Term> = BTreeSet::new();
+                        if hmd >= md {
+                            if let Some(e) = pc.coefficient(hd, hi) {
+                                for (kind, ad, ai) in terms(d - hd, e) {
+                                    for &(ld, li, rd, ri) in cop.terms(ad, ai).iter() {
+                                        if md + rd == hmd && act(rd, ri, md, mi).contains(&hmi) {
+                                            let key = (kind, ld, li);
+                                            if !naive.remove(&key) {
+                                                naive.insert(key);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if actual == naive {
+                            continue;
+                        }
+                        defects += 1;
+                        let defect: BTreeSet<Term> =
+                            actual.symmetric_difference(&naive).copied().collect();
+                        // the predicted carry over all paths g -> y -> x = h
+                        let mut pred: [BTreeSet<Term>; 4] = Default::default();
+                        for yd in hd..d {
+                            for yi in 0..p1.number_of_gens_in_degree(yd) {
+                                let aoff = p1.generator_offset(d, yd, yi);
+                                let ad = d - yd;
+                                for ai in 0..algebra.dimension(ad) {
+                                    if dg.entry(aoff + ai) == 0 {
+                                        continue;
+                                    }
+                                    let dy = d_s1.output(yd, yi);
+                                    let boff = p2.generator_offset(yd, hd, hi);
+                                    let bd = yd - hd;
+                                    for bi in 0..algebra.dimension(bd) {
+                                        if dy.entry(boff + bi) == 0 {
+                                            continue;
+                                        }
+                                        let c = carry((ad, ai), (bd, bi), md, mi, hmd, hmi);
+                                        for v in 0..4 {
+                                            for &k in &c[v] {
+                                                if !pred[v].remove(&k) {
+                                                    pred[v].insert(k);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        for v in 0..4 {
+                            if pred[v] == defect {
+                                explained[v] += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "carry prediction: {defects} defective coefficients; explained by variant \
+         [chi a''b'', chi b''a'', a''b'', b''a'']: {explained:?}"
+    );
 
     let (mut total, mut differ) = (0, 0);
     for s in 2..=max_s {
