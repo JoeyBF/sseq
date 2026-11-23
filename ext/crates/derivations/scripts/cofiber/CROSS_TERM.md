@@ -91,3 +91,14 @@ nonzero cross d₂ mod B, stem 66), C2 ∧ Cσ (32, stem 56; 116 failures withou
 cofiber of a class α in Adams filtration 2, whose module is split) adds its cocycle (for C(α), the
 cobar representative of α on the top → bottom block). The Joker's single contradictory equation
 remains: the derived W still matches its truth, so the missing obstruction term is invisible there.
+
+## From the sphere alone (`module_d2`)
+
+`twisted_w <module>` with `NORM=nopath SPEC_OUT=<file>` writes a module spec (`specs/`): per pair
+of cells the χ-shear `H:e` operators and the normalized path weight. `module_d2` (conesrc,
+secprod-timing) predicts every unit-coefficient block of `H_Q` from that spec using only coefficient
+reads of the sphere's `d` and `H`: no lifting, no tensor resolution. `md2check.sh` compares it with
+`cell_truth` on cocycles of Hom(Q) modulo coboundaries, all blocks including the diagonal:
+identical for all ten modules (C2, Cη, Cν, Cσ to stem 38; C2_eta, Joker, C2 ∧ Cη, C2 ∧ Cν to
+stem 66; C2 ∧ Cσ, Cη ∧ Cν to stem 56). Cost to stem 190 (s ≤ 96): about 17 s and 7.7 GB per module,
+mostly loading the sphere's secondary data.

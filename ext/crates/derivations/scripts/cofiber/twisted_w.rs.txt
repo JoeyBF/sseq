@@ -256,6 +256,33 @@ fn main() -> anyhow::Result<()> {
     for ((cd, bd), v) in spec {
         println!("{cd}>{bd}:{}", if v.is_empty() { "0".to_string() } else { v.join("+") });
     }
+    // SPEC_OUT=<file>: everything module_d2 needs, per pair of cells: `block,c_deg,c_idx,b_deg,
+    // b_idx,op+op` (the antipode shear `H:e`, the path weight `d:a|a'`, and `H:1` on the diagonal)
+    if let Ok(path) = std::env::var("SPEC_OUT") {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        writeln!(f, "module,{name}")?;
+        for &c in &cells {
+            writeln!(f, "block,{},{},{},{},H:1", c.0, c.1, c.0, c.1)?;
+        }
+        for &(c, b) in &blocks {
+            let delta = c.0 - b.0;
+            let mut ops = vec![];
+            for e in 0..algebra.dimension(delta) {
+                if act(&chi.apply(delta, e), b, c) != 0 {
+                    ops.push(format!("H:{}", s(delta, e)));
+                }
+            }
+            for (k, &(cc, bb, d1, i1, d2, i2)) in unk_list.iter().enumerate() {
+                if (cc, bb) == (c, b) && sol[k / 64] >> (k % 64) & 1 != 0 {
+                    ops.push(format!("d:{}|{}", s(d1, i1), s(d2, i2)));
+                }
+            }
+            if !ops.is_empty() {
+                writeln!(f, "block,{},{},{},{},{}", c.0, c.1, b.0, b.1, ops.join("+"))?;
+            }
+        }
+    }
     // NULL_OUT=<file>: a basis of the homogeneous solutions, one per free variable, as
     // `name|c>b:op+op|c>b:op...`
     if let Ok(path) = std::env::var("NULL_OUT") {
