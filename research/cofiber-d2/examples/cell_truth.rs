@@ -1,0 +1,183 @@
+//! Ground truth for the secondary structure of an arbitrary finite module $M$ on the cochains
+//! $\bigoplus_c \mathrm{Hom}(P)\cdot c$ of the untwisted tensor resolution $Q = P \otimes M$, from a
+//! full secondary resolution of $Q$.
+//!
+//! For every sphere basis cochain $e$ at $(n, s)$ (on the generator $x$) and every basis element
+//! $c$ of $M$, applies $Q$'s secondary homotopy to the cochain $e \cdot c$ (dual to $x \otimes c$)
+//! and, for every basis element $b$ of $M$, writes its values on the generators $g \otimes b$ of
+//! $Q_{s+2}$, as a vector over the sphere generators $g$ of $P_{s+2}$ in degree
+//! $t(x) + |c| + 1 - |b|$.
+//!
+//! # Usage
+//! Prompts as `secondary` for the sphere (S_2, save dir, max n, max s); env `CELL_MODULES`
+//! (comma separated module names), `TRUTH_MAX_N`, `TRUTH_MAX_S`.
+//!
+//! # Output (stdout)
+//! `module,stem,Adams_filtration,index,c_deg,c_idx,b_deg,b_idx,values`.
+
+use std::sync::Arc;
+
+use algebra::{
+    Algebra,
+    module::{FDModule, Module},
+};
+use ext::{
+    chain_complex::{ChainComplex, FreeChainComplex},
+    ext_algebra::tensor_resolution::TensorResolutionSecondary,
+    utils::{load_module_json, query_module},
+};
+use sseq::coordinates::Bidegree;
+
+fn main() -> anyhow::Result<()> {
+    ext::utils::init_logging()?;
+    let res = Arc::new(query_module(Some(algebra::AlgebraType::Milnor), false)?);
+    let max_n: i32 = std::env::var("TRUTH_MAX_N").map_or(40, |v| v.parse().unwrap());
+    let max_s: i32 = std::env::var("TRUTH_MAX_S").map_or(20, |v| v.parse().unwrap());
+    let specs = std::env::var("CELL_MODULES").unwrap_or_else(|_| "C2_sm_Ceta".to_string());
+    let algebra = res.algebra();
+    let t_max = max_n + max_s + 16;
+    algebra.compute_basis(t_max + 1);
+    println!("module,stem,Adams_filtration,index,c_deg,c_idx,b_deg,b_idx,values");
+    for name in specs.split(',') {
+        let json = load_module_json(name)?;
+        let m = FDModule::from_json(Arc::clone(&algebra), &json)?;
+        m.compute_basis(t_max);
+        let module = Arc::new(m);
+        let top_deg = module.max_degree().unwrap_or(0);
+        let min_deg = module.min_degree();
+        let trs = TensorResolutionSecondary::new(Arc::clone(&res), Arc::clone(&module));
+        let pmax = max_n + top_deg + 2;
+        trs.resolution().set_pstem_max(pmax);
+        trs.compute_through_stem(Bidegree::n_s(max_n + top_deg, max_s));
+        eprintln!("{name}: secondary resolution of P (x) M computed");
+        for s in 2..=max_s + 2 {
+            let h = trs.secondary().homotopy(s);
+            eprintln!("homotopy s={s}: next_degree {} composites max {}", h.homotopies.next_degree(), h.composites.max_degree());
+        }
+        // the module's action: #act,module,a,b_deg,b_idx,c_deg,c_idx for <c, a b> = 1
+        for bd in min_deg..=top_deg {
+            for cd in bd + 1..=top_deg {
+                for ai in 0..algebra.dimension(cd - bd) {
+                    for bi in 0..module.dimension(bd) {
+                        let mut v = fp::vector::FpVector::new(fp::prime::TWO, module.dimension(cd));
+                        module.act_on_basis(v.as_slice_mut(), 1, cd - bd, ai, bd, bi);
+                        for (ci, c) in v.iter_nonzero() {
+                            if c != 0 {
+                                println!(
+                                    "#act,{name},{},{bd},{bi},{cd},{ci}",
+                                    algebra.basis_element_to_string(cd - bd, ai).replace(", ", ";")
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // the sphere: #dim,n,s,dim and #d1,n,s,l,a,[[a](dy)_x over y] for |a| <= top - bottom
+        if std::env::var("CELL_SPHERE").is_ok() {
+            for s in 0..=max_s + 2 {
+                for n in 0..=max_n + top_deg {
+                    let b0 = Bidegree::n_s(n, s);
+                    if !res.has_computed_bidegree(b0) {
+                        continue;
+                    }
+                    let dim = res.number_of_gens_in_bidegree(b0);
+                    println!("#dim,{n},{s},{dim}");
+                    let tx = b0.t();
+                    for ad in 1..=top_deg - min_deg {
+                        let yb = Bidegree::s_t(s + 1, tx + ad);
+                        if !res.has_computed_bidegree(yb) {
+                            continue;
+                        }
+                        let ydim = res.number_of_gens_in_bidegree(yb);
+                        let d1 = res.differential(s + 1);
+                        let p_s = res.module(s);
+                        for l in 0..dim {
+                            for ai in 0..algebra.dimension(ad) {
+                                let off = p_s.generator_offset(yb.t(), tx, l) + ai;
+                                let v: Vec<u32> =
+                                    (0..ydim).map(|y| d1.output(yb.t(), y).entry(off)).collect();
+                                if v.iter().any(|&x| x != 0) {
+                                    println!(
+                                        "#d1,{n},{s},{l},{},\"{v:?}\"",
+                                        algebra.basis_element_to_string(ad, ai).replace(", ", ";")
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let q = trs.resolution();
+        let sec = trs.secondary();
+        let index = |s: i32, t: i32, g: (i32, usize), alpha: usize| -> Option<usize> {
+            let mut idx = 0;
+            for (d, i) in res.module(s).iter_gens(t) {
+                if d - s > pmax {
+                    continue;
+                }
+                let dm = module.dimension(t - d);
+                if (d, i) == g {
+                    return (alpha < dm).then_some(idx + alpha);
+                }
+                idx += dm;
+            }
+            None
+        };
+        for s in 0..=max_s {
+            for n in 0..=max_n {
+                let b0 = Bidegree::n_s(n, s);
+                if !res.has_computed_bidegree(b0) {
+                    continue;
+                }
+                let dim = res.number_of_gens_in_bidegree(b0);
+                if dim == 0 {
+                    continue;
+                }
+                for cd in min_deg..=top_deg {
+                    let t = b0.t() + cd;
+                    let qb = Bidegree::s_t(s, t);
+                    let tgt = Bidegree::s_t(s + 2, t + 1);
+                    if !q.has_computed_bidegree(qb) || !q.has_computed_bidegree(tgt) {
+                        continue;
+                    }
+                    let hom = sec.homotopy(s + 2);
+                    if hom.homotopies.next_degree() <= t + 1 {
+                        continue;
+                    }
+                    let mat = hom.homotopies.hom_k(t);
+                    for ci in 0..module.dimension(cd) {
+                        for l in 0..dim {
+                            let Some(row_i) = index(s, t, (b0.t(), l), ci) else {
+                                continue;
+                            };
+                            let row = &mat[row_i];
+                            for bd in min_deg..=top_deg {
+                                let tg = t + 1 - bd;
+                                let gens: Vec<(i32, usize)> = res
+                                    .module(s + 2)
+                                    .iter_gens(tg)
+                                    .filter(|&(d, _)| d == tg)
+                                    .collect();
+                                if gens.is_empty() {
+                                    continue;
+                                }
+                                for bi in 0..module.dimension(bd) {
+                                    let v: Vec<u32> = gens
+                                        .iter()
+                                        .map(|&g| index(s + 2, t + 1, g, bi).map_or(0, |k| row[k]))
+                                        .collect();
+                                    if v.iter().any(|&x| x != 0) {
+                                        println!("{name},{n},{s},{l},{cd},{ci},{bd},{bi},\"{v:?}\"");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}

@@ -1,0 +1,504 @@
+--- stage/tr_orig.rs	2026-11-23 23:43:35.198162925 -0500
++++ truthsrc/ext/src/ext_algebra/tensor_resolution.rs	2026-11-23 23:39:54.171160953 -0500
+@@ -41,7 +41,7 @@
+ use fp::{
+     matrix::Matrix,
+     prime::{Prime, ValidPrime},
+-    vector::FpVector,
++    vector::{FpSlice, FpSliceMut, FpVector},
+ };
+ use once::{OnceBiVec, OnceVec};
+ use sseq::coordinates::{Bidegree, BidegreeElement};
+@@ -188,13 +188,13 @@
+ /// [`decompose`](Bialgebra::decompose) atoms in $A \otimes A$ — the same route the [`Antipode`]
+ /// uses, but keeping *all* terms (including the two boundary terms $x \otimes 1$ and $1 \otimes
+ /// x$).
+-pub(crate) struct FullCoproduct<A: Bialgebra> {
++pub struct FullCoproduct<A: Bialgebra> {
+     algebra: Arc<A>,
+     cache: DashMap<(i32, usize), Arc<Vec<(i32, usize, i32, usize)>>>,
+ }
+ 
+ impl<A: Bialgebra> FullCoproduct<A> {
+-    pub(crate) fn new(algebra: Arc<A>) -> Self {
++    pub fn new(algebra: Arc<A>) -> Self {
+         Self {
+             algebra,
+             cache: DashMap::new(),
+@@ -203,7 +203,7 @@
+ 
+     /// $\Delta$ of the basis element `(degree, idx)`, as the list of surviving pairs
+     /// `(|a'|, a', |a''|, a'')`. Requires the algebra basis computed through `degree`.
+-    pub(crate) fn terms(&self, degree: i32, idx: usize) -> Arc<Vec<(i32, usize, i32, usize)>> {
++    pub fn terms(&self, degree: i32, idx: usize) -> Arc<Vec<(i32, usize, i32, usize)>> {
+         if degree == 0 {
+             // Δ(1) = 1 ⊗ 1 (the unit is grouplike).
+             return Arc::new(vec![(0, 0, 0, 0)]);
+@@ -797,6 +797,8 @@
+     /// `s` → $\partial_s\colon Q_s \to Q_{s-1}$ (with $\partial_0\colon Q_0 \to 0$).
+     differentials: OnceVec<Arc<FreeModuleHomomorphism<FreeModule<CC::Algebra>>>>,
+     lock: Mutex<()>,
++    /// keep only generators (y, m) with P-stem(y) <= this (see `set_pstem_max`)
++    pstem_max: std::sync::atomic::AtomicI32,
+ }
+ 
+ impl<CC, N> TensorResolution<CC, N>
+@@ -819,9 +821,24 @@
+             modules: OnceBiVec::new(0),
+             differentials: OnceVec::new(),
+             lock: Mutex::new(()),
++            pstem_max: std::sync::atomic::AtomicI32::new(i32::MAX),
+         }
+     }
+ 
++    /// Truncate by the stem of the P-generator: only the generators $(y, m)$ of $Q_s$ with
++    /// $|y| - s \le n$ are kept. Each component of $\partial_Q$ goes from $(x, m)$ to a $(y, m')$
++    /// with $|x| - |y| \ge 1$, so the P-stem never increases and the kept generators span a
++    /// subcomplex, which agrees with $Q$ in Q-stems up to $n$; $P$ and the quasi-inverses are then
++    /// only needed by stem.
++    pub fn set_pstem_max(&self, n: i32) {
++        self.pstem_max
++            .store(n, std::sync::atomic::Ordering::Relaxed);
++    }
++
++    fn kept(&self, s: i32, gen_deg: i32) -> bool {
++        gen_deg - s <= self.pstem_max.load(std::sync::atomic::Ordering::Relaxed)
++    }
++
+     /// Build $Q_s$ (free modules and differentials) for all `s ≤ s_max` through internal degree
+     /// `t_max`. Idempotent and monotone: re-calling with a larger box extends in place.
+     fn extend(&self, s_max: i32, t_max: i32) {
+@@ -832,8 +849,16 @@
+         let algebra = self.resolution.algebra();
+ 
+         // Grow the substrate first: P_• through (s_max, t_max); M and the algebra through t_max.
+-        self.resolution
+-            .compute_through_bidegree(Bidegree::s_t(s_max, t_max));
++        let pmax = self.pstem_max.load(std::sync::atomic::Ordering::Relaxed);
++        if pmax == i32::MAX {
++            self.resolution
++                .compute_through_bidegree(Bidegree::s_t(s_max, t_max));
++        } else {
++            for s in 0..=s_max {
++                self.resolution
++                    .compute_through_bidegree(Bidegree::s_t(s, pmax + 1 + s));
++            }
++        }
+         self.module.compute_basis(t_max);
+         algebra.compute_basis(t_max);
+         self.zero_module.compute_basis(t_max);
+@@ -855,6 +880,7 @@
+                 // Generators of Q_s at degree d: the (i, α) with |x_i| + |m_α| = d.
+                 let count: usize = p_s
+                     .iter_gens(d)
++                    .filter(|&(d_i, _)| self.kept(s, d_i))
+                     .map(|(d_i, _)| self.module.dimension(d - d_i))
+                     .sum();
+                 fm.add_generators(d, count, None);
+@@ -894,7 +920,16 @@
+         // quasi-inverse (image/kernel/QI). Minimal resolvers build these while resolving; here we
+         // compute them explicitly for the materialised free differentials.
+         for s in 0..=s_max {
+-            self.differentials[s as usize].compute_auxiliary_data_through_degree(t_max);
++            if !dense_qi() {
++                // lifts go through the resolution's quasi-inverses (`apply_quasi_inverse`)
++                break;
++            }
++            let t_aux = if pmax == i32::MAX {
++                t_max
++            } else {
++                t_max.min(pmax + s + 2 + self.module.max_degree().unwrap_or(0) + 2)
++            };
++            self.differentials[s as usize].compute_auxiliary_data_through_degree(t_aux);
+         }
+     }
+ 
+@@ -913,14 +948,19 @@
+ 
+         let mut rows: Vec<FpVector> = Vec::with_capacity(fm.number_of_gens_in_degree(degree));
+         for (d_i, i) in p_s.iter_gens(degree) {
++            if !self.kept(s, d_i) {
++                continue;
++            }
+             let e_alpha = degree - d_i;
+             let m_dim = self.module.dimension(e_alpha);
+             if m_dim == 0 {
+                 continue;
+             }
+             // ∂_P(x_i) ∈ (P_{s-1})_{d_i}.
+-            let mut dp = FpVector::new(p, p_prev.dimension(d_i));
+-            d_p.apply_to_generator(&mut dp, 1, d_i, i);
++            // The stored output can be longer than P_{s-1} as loaded so far: it has slots for the
++            // generators of degree d_i itself (always zero in a minimal resolution), which sort
++            // last, so the loaded generators' offsets are unaffected.
++            let dp = d_p.output(d_i, i).clone();
+ 
+             for alpha in 0..m_dim {
+                 let mut out = FpVector::new(p, tgt_dim);
+@@ -1001,6 +1041,9 @@
+         let p_s = self.resolution.module(s);
+         let mut idx = 0;
+         for (dk, k) in p_s.iter_gens(gen_deg) {
++            if !self.kept(s, dk) {
++                continue;
++            }
+             if dk == target_pdeg && k == target_pidx {
+                 return idx + beta;
+             }
+@@ -1008,6 +1051,98 @@
+         }
+         panic!("generator ({target_pdeg}, {target_pidx}) not found in Q_{s} at degree {gen_deg}");
+     }
++
++    /// $\Phi$ on an element of $(Q_s)_t$: its components in $\bigoplus_e \bigoplus_{\alpha \in M_e}
++    /// (P_s)_{t-e}$, indexed `[e - min degree of M][α]`.
++    pub fn phi(&self, s: i32, t: i32, input: FpSlice) -> Vec<Vec<FpVector>> {
++        let p = self.resolution.prime();
++        let m_min = self.module.min_degree();
++        let m_max = self.module.max_degree().unwrap_or(m_min);
++        let q = &self.modules[s];
++        let ps = self.resolution.module(s);
++        let mut split: Vec<Vec<FpVector>> = (m_min..=m_max)
++            .map(|e| {
++                let dim = if t - e >= ps.min_degree() && ps.max_computed_degree() >= t - e {
++                    ps.dimension(t - e)
++                } else {
++                    0
++                };
++                vec![FpVector::new(p, dim); self.module.dimension(e)]
++            })
++            .collect();
++        let gens = self.gen_table(s, t);
++        for (i, c) in input.iter_nonzero() {
++            let og = q.index_to_op_gen(t, i);
++            let (y_deg, y_idx, e_beta, beta) = gens[&(og.generator_degree, og.generator_index)];
++            for &(_l_deg, l_idx, r_deg, r_idx) in
++                self.coproduct.terms(og.operation_degree, og.operation_index).iter()
++            {
++                let e2 = e_beta + r_deg;
++                if e2 > m_max {
++                    continue;
++                }
++                let mut acted = FpVector::new(p, self.module.dimension(e2));
++                if r_deg == 0 {
++                    acted.add_basis_element(beta, c);
++                } else {
++                    self.module.act_on_basis(acted.as_slice_mut(), c, r_deg, r_idx, e_beta, beta);
++                }
++                for (alpha, ac) in acted.iter_nonzero() {
++                    let off = ps.generator_offset(t - e2, y_deg, y_idx) + l_idx;
++                    split[(e2 - m_min) as usize][alpha].add_basis_element(off, ac);
++                }
++            }
++        }
++        split
++    }
++
++    /// The index of generator $(x, m_\alpha)$ of $Q_s$ in degree `gen_deg`, if kept.
++    pub fn q_gen_index(
++        &self,
++        s: i32,
++        gen_deg: i32,
++        pdeg: i32,
++        pidx: usize,
++        alpha: usize,
++    ) -> Option<usize> {
++        self.try_local_gen_index(s, gen_deg, pdeg, pidx, alpha)
++    }
++
++    /// [`Self::local_gen_index`], or `None` when $(y_j, m_\beta)$ is not a kept generator.
++    fn try_local_gen_index(
++        &self,
++        s: i32,
++        gen_deg: i32,
++        target_pdeg: i32,
++        target_pidx: usize,
++        beta: usize,
++    ) -> Option<usize> {
++        if !self.kept(s, target_pdeg) || beta >= self.module.dimension(gen_deg - target_pdeg) {
++            return None;
++        }
++        Some(self.local_gen_index(s, gen_deg, target_pdeg, target_pidx, beta))
++    }
++
++    /// The generators of $Q_s$ in degrees `..= t`: (degree, index) ↦ (degree and index of the
++    /// $P_s$-generator, degree and index of the basis element of $M$).
++    fn gen_table(&self, s: i32, t: i32) -> HashMap<(i32, usize), (i32, usize, i32, usize)> {
++        let p_s = self.resolution.module(s);
++        let mut out = HashMap::new();
++        for gen_deg in 0..=t {
++            let mut idx = 0;
++            for (dk, k) in p_s.iter_gens(gen_deg) {
++                if !self.kept(s, dk) {
++                    continue;
++                }
++                let e = gen_deg - dk;
++                for beta in 0..self.module.dimension(e) {
++                    out.insert((gen_deg, idx), (dk, k, e, beta));
++                    idx += 1;
++                }
++            }
++        }
++        out
++    }
+ }
+ 
+ impl<CC, N> ChainComplex for TensorResolution<CC, N>
+@@ -1053,6 +1188,184 @@
+     fn next_homological_degree(&self) -> i32 {
+         self.modules.len()
+     }
++
++    /// Under a P-stem truncation at `n`, a generator $(x, m)$ is trusted when the P-stem of $x$
++    /// is at most `n - 2`: $\partial$ never raises the P-stem of a generator's support and $H$
++    /// raises it by at most one, so these see only the part of $Q$ the truncation keeps whole.
++    fn generator_trusted(&self, b: Bidegree, idx: usize) -> bool {
++        let pmax = self.pstem_max.load(std::sync::atomic::Ordering::Relaxed);
++        if pmax == i32::MAX {
++            return true;
++        }
++        let mut i = 0;
++        for (dk, _) in self.resolution.module(b.s()).iter_gens(b.t()) {
++            if !self.kept(b.s(), dk) {
++                continue;
++            }
++            i += self.module.dimension(b.t() - dk);
++            if idx < i {
++                return dk - b.s() <= pmax - 2;
++            }
++        }
++        false
++    }
++
++    /// Lifts through $\partial_Q = \Psi (\partial_P \otimes 1) \Phi$ with the resolution's own
++    /// quasi-inverses: as a complex of vector spaces $P \otimes M = \bigoplus_m P \otimes m$, so
++    /// $\Phi$ splits an input into one element of $P_{s-1}$ per basis element $m$ of $M$, each is
++    /// lifted through $\partial_P$, and $\Psi$ reassembles the lifts. No row reduction of
++    /// $\partial_Q$ is needed.
++    fn apply_quasi_inverse<T, S>(&self, results: &mut [T], b: Bidegree, inputs: &[S]) -> bool
++    where
++        for<'a> &'a mut T: Into<FpSliceMut<'a>>,
++        for<'a> &'a S: Into<FpSlice<'a>>,
++    {
++        assert_eq!(results.len(), inputs.len());
++        if results.is_empty() {
++            return true;
++        }
++        if dense_qi() {
++            let d = self.differential(b.s());
++            return inputs
++                .iter()
++                .zip(results.iter_mut())
++                .all(|(i, r)| d.apply_quasi_inverse(r.into(), b.t(), i.into()));
++        }
++        let (s, t) = (b.s(), b.t());
++        let p = self.resolution.prime();
++        let m_min = self.module.min_degree();
++        let m_max = self.module.max_degree().unwrap_or(m_min);
++        let q_tgt = &self.modules[s - 1];
++        let p_tgt = self.resolution.module(s - 1);
++        let p_src = self.resolution.module(s);
++
++        // Φ: (Q_{s-1})_t → ⊕_e ⊕_{α ∈ M_e} (P_{s-1})_{t-e}, b·(y ⊗ m) ↦ Σ b'y ⊗ b''m.
++        // split[e - m_min][α][input]
++        let mut split: Vec<Vec<Vec<FpVector>>> = (m_min..=m_max)
++            .map(|e| {
++                let dim = if t - e >= p_tgt.min_degree() && p_tgt.max_computed_degree() >= t - e {
++                    p_tgt.dimension(t - e)
++                } else {
++                    0
++                };
++                vec![vec![FpVector::new(p, dim); inputs.len()]; self.module.dimension(e)]
++            })
++            .collect();
++        let tgt_gens = self.gen_table(s - 1, t);
++        for (k, input) in inputs.iter().enumerate() {
++            let input: FpSlice = input.into();
++            for (i, c) in input.iter_nonzero() {
++                let og = q_tgt.index_to_op_gen(t, i);
++                let (y_deg, y_idx, e_beta, beta) =
++                    tgt_gens[&(og.generator_degree, og.generator_index)];
++                for &(_l_deg, l_idx, r_deg, r_idx) in self
++                    .coproduct
++                    .terms(og.operation_degree, og.operation_index)
++                    .iter()
++                {
++                    let e2 = e_beta + r_deg;
++                    if e2 > m_max {
++                        continue;
++                    }
++                    let mut acted = FpVector::new(p, self.module.dimension(e2));
++                    if r_deg == 0 {
++                        acted.add_basis_element(beta, c);
++                    } else {
++                        self.module.act_on_basis(
++                            acted.as_slice_mut(),
++                            c,
++                            r_deg,
++                            r_idx,
++                            e_beta,
++                            beta,
++                        );
++                    }
++                    for (alpha, ac) in acted.iter_nonzero() {
++                        let v = &mut split[(e2 - m_min) as usize][alpha][k];
++                        let off = p_tgt.generator_offset(t - e2, y_deg, y_idx) + l_idx;
++                        v.add_basis_element(off, ac);
++                    }
++                }
++            }
++        }
++
++        // Lift each component through ∂_P and apply Ψ: b·x ⊗ m ↦ Σ b'·(x ⊗ χ(b'') m).
++        let q_src = &self.modules[s];
++        for e in m_min..=m_max {
++            let te = t - e;
++            for (alpha, comps) in split[(e - m_min) as usize].iter().enumerate() {
++                if comps.iter().all(|v| v.is_zero()) {
++                    continue;
++                }
++                let mut lifts = vec![FpVector::new(p, p_src.dimension(te)); inputs.len()];
++                if !self.resolution.apply_quasi_inverse::<FpVector, FpVector>(
++                    lifts.as_mut_slice(),
++                    Bidegree::s_t(s, te),
++                    comps.as_slice(),
++                ) {
++                    tracing::warn!("tensor QI: resolution QI missing at ({s}, {te})");
++                    return false;
++                }
++                for (k, w) in lifts.iter().enumerate() {
++                    let mut out: FpSliceMut = (&mut results[k]).into();
++                    for (i, c) in w.iter_nonzero() {
++                        let og = p_src.index_to_op_gen(te, i);
++                        for &(l_deg, l_idx, r_deg, r_idx) in self
++                            .coproduct
++                            .terms(og.operation_degree, og.operation_index)
++                            .iter()
++                        {
++                            let e2 = e + r_deg;
++                            if e2 > m_max {
++                                continue;
++                            }
++                            let mut acted = FpVector::new(p, self.module.dimension(e2));
++                            if r_deg == 0 {
++                                acted.add_basis_element(alpha, c);
++                            } else {
++                                let chi = self.antipode.apply(r_deg, r_idx);
++                                for (op_idx, op_c) in chi.iter_nonzero() {
++                                    self.module.act_on_basis(
++                                        acted.as_slice_mut(),
++                                        (op_c * c) % p.as_u32(),
++                                        r_deg,
++                                        op_idx,
++                                        e,
++                                        alpha,
++                                    );
++                                }
++                            }
++                            for (beta, bc) in acted.iter_nonzero() {
++                                let gen_deg = og.generator_degree + e2;
++                                let Some(gi) = self.try_local_gen_index(
++                                    s,
++                                    gen_deg,
++                                    og.generator_degree,
++                                    og.generator_index,
++                                    beta,
++                                ) else {
++                                    // beyond the P-stem truncation, which only feeds stems above it
++                                    continue;
++                                };
++                                debug_assert_eq!(t - gen_deg, l_deg);
++                                out.add_basis_element(
++                                    q_src.generator_offset(t, gen_deg, gi) + l_idx,
++                                    bc,
++                                );
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        true
++    }
++}
++
++/// Whether `TENSOR_DENSE_QI` asks for the quasi-inverses of $\partial_Q$ itself (a dense row
++/// reduction of every $\partial_Q$) instead of lifting through the resolution's quasi-inverses.
++fn dense_qi() -> bool {
++    std::env::var("TENSOR_DENSE_QI").is_ok()
+ }
+ 
+ /// The Adams $d_2$ on $\Ext_A(M, k)$ for a module resolved by the untwisted tensor resolution.
+@@ -1114,6 +1427,11 @@
+         &self.resolution
+     }
+ 
++    /// The secondary resolution of $Q_\bullet$ (its homotopies give $d_2$ on cochains).
++    pub fn secondary(&self) -> &Arc<SecondaryResolution<TensorResolution<CC, N>>> {
++        &self.secondary
++    }
++
+     /// The $E_2$ page $\Ext_A(M, k)$, with cohomology exposed via
+     /// [`lift`](ExtAlgebra::lift)/[`project`](ExtAlgebra::project).
+     pub fn ext(&self) -> &ExtAlgebra<TensorResolution<CC, N>> {
+@@ -1201,11 +1519,60 @@
+                 }
+             }
+         }
++        if std::env::var("TRS_NO_CARRY").is_err() {
++            self.add_carry(b, cocycle.vec(), &mut out);
++        }
+ 
+         // Project the resulting cochain back to an Ext class (quotient by coboundaries).
+         Some(self.e2.project(&Cochain::new(target, out)))
+     }
+ 
++    /// Adds the Z/4 carry of a cocycle to its cochain-level d2 (p = 2).
++    ///
++    /// $Q_\bullet$ is not minimal: the cocycle $c$ at `b` has $c \circ d = 0$ mod 2, but with the
++    /// unit coefficients of $d$ lifted to 1 it is $2w$ over Z/4, and $2 = \lambda h_0$ adds $h_0 w$,
++    /// read through the $Sq^1$ coefficients of $d$ out of $Q_{s+2}$.
++    fn add_carry(&self, b: Bidegree, cocycle: fp::vector::FpSlice, out: &mut FpVector) {
++        if self.prime().as_u32() != 2 {
++            return;
++        }
++        let q = &self.resolution;
++        let (s, t) = (b.s(), b.t());
++        let next = Bidegree::s_t(s + 1, t);
++        if !q.has_computed_bidegree(next) || !q.has_computed_bidegree(Bidegree::s_t(s + 2, t + 1))
++        {
++            return;
++        }
++        let (q_s, q_s1) = (q.module(s), q.module(s + 1));
++        let d1 = q.differential(s + 1);
++        let mut w = vec![];
++        for g in 0..q_s1.number_of_gens_in_degree(t) {
++            let dg = d1.output(t, g);
++            let count: u32 = cocycle
++                .iter_nonzero()
++                .map(|(i, _)| dg.entry(q_s.generator_offset(t, t, i)))
++                .sum();
++            assert!(count % 2 == 0, "not a cocycle");
++            if count % 4 == 2 {
++                w.push(g);
++            }
++        }
++        if w.is_empty() {
++            return;
++        }
++        let d2 = q.differential(s + 2);
++        for (k, _) in (0..q.module(s + 2).number_of_gens_in_degree(t + 1)).map(|k| (k, ())) {
++            let dk = d2.output(t + 1, k);
++            let v: u32 = w
++                .iter()
++                .map(|&g| dk.entry(q_s1.generator_offset(t + 1, t, g)))
++                .sum();
++            if v % 2 == 1 {
++                out.add_basis_element(k, 1);
++            }
++        }
++    }
++
+     /// Whether `x` is a $d_2$-cycle (survives to $E_3$). `None` if $d_2$ is out of range.
+     pub fn survives(&self, x: &BidegreeElement) -> Option<bool> {
+         self.d2(x).map(|d| d.vec().is_zero())

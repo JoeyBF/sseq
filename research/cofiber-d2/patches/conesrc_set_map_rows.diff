@@ -1,0 +1,16 @@
+--- stage/rh_orig.rs	2026-11-23 23:43:27.368739537 -0500
++++ conesrc/src/resolution_homomorphism.rs	2026-11-23 20:26:01.596105001 -0500
+@@ -132,6 +132,13 @@
+         self.maps.values().map(|m| m.resident_bytes()).sum()
+     }
+ 
++    /// Sets the chain map on the generators of `(input_s, t)` to `rows`, for a chain map given
++    /// explicitly rather than lifted. Degrees of one `input_s` must be set in increasing order.
++    pub fn set_map_rows(&self, input_s: i32, t: i32, rows: Vec<FpVector>) {
++        self.get_map_ensure_length(input_s)
++            .add_generators_from_rows(t, rows);
++    }
++
+     /// Returns the chain map on the `s`th source module.
+     pub fn get_map(&self, input_s: i32) -> Arc<MuFreeModuleHomomorphism<U, CC2::Module>> {
+         Arc::clone(&self.maps[input_s])

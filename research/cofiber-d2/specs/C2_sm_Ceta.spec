@@ -1,0 +1,10 @@
+module,C2_sm_Ceta
+block,0,0,0,0,H:1
+block,1,0,1,0,H:1
+block,2,0,2,0,H:1
+block,3,0,3,0,H:1
+block,1,0,0,0,H:P(1)
+block,2,0,0,0,H:P(2)
+block,3,0,0,0,H:P(3)
+block,3,0,1,0,H:P(2)
+block,3,0,2,0,H:P(1)
