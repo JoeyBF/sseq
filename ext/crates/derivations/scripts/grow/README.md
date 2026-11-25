@@ -12,4 +12,10 @@ products; nothing is resolved or lifted.
   two-cell convention. Valid for stems below the resolution's max stem and filtrations below its
   max filtration.
 - `slots.py`: coordinates of cocycles in that basis (maps induced by cells).
-- `cmp_slots.py`: check against `cofiber_slots` on two-cell complexes.
+- `cmp_slots.py`, `cmp_hact.py`: checks against `cofiber_slots` and the h0-h7 product table.
+
+`module_slots` is the closed form of `tensor_resolution_ext` (the untwisted tensor resolution
+`P ⊗ M`, never materialised), with the basis pinned to `cofiber_slots`. The h_i action uses the
+chain map `g ↦ θ_i(dg)`, `θ_i(Sq(R)) = Sq(R - 2^i e_1)`, so it needs no lifting either; other sphere
+classes act through their saved maps of `P` (`tensor_resolution_products`). d2 comes from
+`module_d2`'s formula, not `TensorResolutionSecondary`, which materialises `P ⊗ M`.

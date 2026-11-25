@@ -275,6 +275,8 @@ fn main() -> anyhow::Result<()> {
     writeln!(rank, "stem,Adams_filtration,rank")?;
     writeln!(basis, "stem,Adams_filtration,index,coords")?;
     writeln!(bound, "stem,Adams_filtration,index,coords")?;
+    let mut ext_at: std::collections::HashMap<(i32, i32), (Vec<Bits>, Vec<Bits>)> =
+        Default::default();
     for s in 0..=max_s {
         for n in 0..=max_n {
             let (_, len) = layout(n, s);
@@ -293,6 +295,102 @@ fn main() -> anyhow::Result<()> {
             }
             for (i, v) in b.iter().enumerate() {
                 writeln!(bound, "{n},{s},{i},{}", fmt(n, s, v, len))?;
+            }
+            ext_at.insert((n, s), (reps, b));
+        }
+    }
+    drop((rank, basis, bound));
+
+    // h_i acts through the chain map g ↦ θ_i(dg) lifting h_i, θ_i(Sq(R)) = Sq(R - 2^i e_1):
+    // (h_i φ)(g' ⊗ m') = Σ [Sq(R_b + 2^i e_1), g](dg') φ(g ⊗ χ(b) m') over b of degree |m| - |m'|.
+    let mut hact = BufWriter::new(File::create(dir.join(format!("{name}_hact.csv")))?);
+    writeln!(
+        hact,
+        "stem_1,Adams_filtration_1,index_1,stem_2,Adams_filtration_2,index_2,product"
+    )?;
+    let max_i = 7;
+    algebra.compute_basis(span + (1 << max_i));
+    // coordinates of a cocycle in the basis at (n, s)
+    let coords = |n: i32, s: i32, v: Bits| -> Option<Vec<bool>> {
+        let (reps, b) = ext_at.get(&(n, s))?;
+        let mut v = reduce(b, v);
+        let mut out = vec![false; reps.len()];
+        for (i, r) in reps.iter().enumerate() {
+            if v.get(r.first().unwrap()) {
+                v.xor(r);
+                out[i] = true;
+            }
+        }
+        assert!(v.is_zero(), "h_i product is not a cocycle at ({n}, {s})");
+        Some(out)
+    };
+    for i in 0..=max_i {
+        let k = 1i32 << i;
+        for s in 0..max_s {
+            for n in 0..=max_n {
+                let (tn_, ts) = (n + k - 1, s + 1);
+                if tn_ > max_n {
+                    continue;
+                }
+                let Some((reps, _)) = ext_at.get(&(n, s)) else {
+                    continue;
+                };
+                if reps.is_empty() || !ext_at.contains_key(&(tn_, ts)) {
+                    continue;
+                }
+                let (so, sn) = layout(n, s);
+                let (to, tn) = layout(tn_, ts);
+                let t = n + s;
+                let src = res.module(s);
+                let dif = res.differential(ts);
+                // image of each source coordinate
+                let mut images = vec![Bits::zero(tn); sn];
+                for (c2, &(d2, _)) in cells.iter().enumerate() {
+                    let tb = Bidegree::n_s(tn_ - (d2 - lo), ts);
+                    let tdeg = t + k - (d2 - lo);
+                    for g2 in 0..gens(tb) {
+                        let dg = dif.output(tdeg, g2);
+                        for (c, &(d, _)) in cells.iter().enumerate() {
+                            let od = d - d2;
+                            if od < 0 {
+                                continue;
+                            }
+                            let sb = Bidegree::n_s(n - (d - lo), s);
+                            if gens(sb) == 0 {
+                                continue;
+                            }
+                            for oi in 0..algebra.dimension(od) {
+                                if !chi[od as usize][oi][c2].contains(&c) {
+                                    continue;
+                                }
+                                let mut e = milnor.basis_element_from_index(od, oi);
+                                e.p_part.set(0, e.p_part.get(0) + k as u32);
+                                e.degree += k;
+                                let ai = milnor.basis_element_to_index(&e);
+                                for g in 0..gens(sb) {
+                                    let idx = src.operation_generator_to_index(od + k, ai, sb.t(), g);
+                                    if dg.entry(idx) == 1 {
+                                        images[so[c] + g].flip(to[c2] + g2);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for (xi, r) in reps.iter().enumerate() {
+                    let mut im = Bits::zero(tn);
+                    for j in r.ones(sn) {
+                        im.xor(&images[j]);
+                    }
+                    let v = coords(tn_, ts, im).unwrap();
+                    let body: Vec<String> = v.iter().map(|&b| (b as u8).to_string()).collect();
+                    let vs = if v.len() == 1 {
+                        format!("[{}]", body[0])
+                    } else {
+                        format!("\"[{}]\"", body.join(", "))
+                    };
+                    writeln!(hact, "{},1,0,{n},{s},{xi},{vs}", k - 1)?;
+                }
             }
         }
     }
